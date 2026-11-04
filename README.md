@@ -54,3 +54,35 @@ Push thư mục này lên GitHub, tạo Web Service từ repository, chọn Dock
 - URL lấy từ `/stream` có thể hết hạn nhanh; gọi API lại khi cần.
 - Proxy MP3 dùng CPU và băng thông của server. Không nên chạy nhiều luồng đồng thời trên gói miễn phí.
 - Chỉ sử dụng với nội dung bạn có quyền truy cập và phát lại. Server không vượt DRM hay quyền truy cập.
+
+## Phát YouTube realtime kiểu IPTV (hình + tiếng riêng)
+
+Pipeline dùng `yt-dlp` lấy URL media, sau đó FFmpeg giải mã đồng thời:
+
+- Hình: MJPEG multipart, mặc định 320×180, 10 FPS.
+- Tiếng: PCM signed 16-bit little-endian, mono, 16 kHz, chia khung 20 ms.
+
+### Trình tự gọi
+
+1. Bắt đầu giải mã video:
+   `GET /api/youtube/watch?id=VIDEO_ID`
+2. Đọc hình liên tục:
+   `GET /api/youtube/video.mjpg`
+3. Đọc âm thanh PCM liên tục:
+   `GET /api/youtube/audio.pcm`
+4. Dừng:
+   `POST /api/youtube/stop`
+5. Kiểm tra:
+   `GET /api/youtube/playback/status`
+
+Ví dụ bắt đầu:
+
+```bash
+curl "http://localhost:10000/api/youtube/watch?id=VIDEO_ID"
+```
+
+Response trả về hai endpoint `video` và `audio`. Client hiển thị MJPEG như luồng camera/IPTV; client âm thanh phải đọc PCM 16-bit little-endian ở 16000 Hz, mono và phát qua audio output. PCM thô không phải MP3/WAV nên thẻ HTML `<audio>` không phát trực tiếp được nếu không có bộ nhận/giải mã PCM ở client.
+
+Các biến môi trường tùy chỉnh: `PLAYBACK_WIDTH`, `PLAYBACK_HEIGHT`, `PLAYBACK_FPS`, `PLAYBACK_JPEG_QUALITY`, `PLAYBACK_AUDIO_RATE`.
+
+**Lưu ý:** Đây là một pipeline phát chung trên server: tại một thời điểm chỉ chọn được một video; các client kết nối cùng xem video đó. Video và audio được truyền trên hai kết nối riêng, vì vậy ứng dụng client cần ghép thời gian phát hai luồng. Chất lượng/độ trễ phụ thuộc nguồn YouTube, CPU, mạng và khả năng xử lý của client.
