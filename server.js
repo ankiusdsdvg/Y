@@ -29,6 +29,7 @@ function validTrackUrl(value) {
   }
 }
 
+// Run yt-dlp and receive JSON
 function runJson(args, res, transform = data => data) {
   const child = spawn(YTDLP, args, {
     stdio: ["ignore", "pipe", "pipe"]
@@ -104,6 +105,7 @@ function runJson(args, res, transform = data => data) {
   });
 }
 
+// Normalize search results
 function normalizeTrack(x) {
   const page = x.webpage_url ||
     (typeof x.url === "string" && x.url.startsWith("https://soundcloud.com/")
@@ -224,9 +226,9 @@ app.get("/api/soundcloud/resolve", (req, res) => {
   );
 });
 
-// ========================================
-// STREAM - FAST START + CONTINUOUS BUFFER
-// ========================================
+// ============================================
+// STREAM - FIFO QUEUE / NO DATA LOSS
+// ============================================
 app.get("/api/soundcloud/stream", (req, res) => {
   const url = String(req.query.url || "");
 
@@ -277,39 +279,44 @@ app.get("/api/soundcloud/stream", (req, res) => {
   let started = false;
   let finished = false;
   let sourceEnded = false;
+  let waitingDrain = false;
   let errors = "";
 
-  // Buffer tối đa 32 MB.
-  // Không xóa dữ liệu cũ.
+  // Maximum RAM queue: 32 MB
   const MAX_BUFFER_BYTES = 32 * 1024 * 1024;
 
-  // Mỗi lần gửi 16 KB.
+  // HTTP write chunk
   const SEND_CHUNK_BYTES = 16 * 1024;
 
-  // Danh sách buffer dạng queue, tránh Buffer.concat liên tục.
+  // FIFO queue
   let queue = [];
-  let queueIndex = 0;
+  let head = 0;
+  let headOffset = 0;
   let bufferedBytes = 0;
+
+  // Only one overflow chunk is allowed.
+  // Source is paused immediately while it is pending.
+  let pendingChunk = null;
+  let pendingOffset = 0;
+
+  let timer;
 
   function addError(data) {
     errors = (errors + data.toString()).slice(-4000);
   }
 
   function stopProcesses() {
-    if (downloader.exitCode === null &&
-        !downloader.killed) {
+    if (downloader.exitCode === null && !downloader.killed) {
       downloader.kill("SIGKILL");
     }
 
-    if (transcoder.exitCode === null &&
-        !transcoder.killed) {
+    if (transcoder.exitCode === null && !transcoder.killed) {
       transcoder.kill("SIGKILL");
     }
   }
 
   function cleanup() {
     clearTimeout(timer);
-    clearInterval(sendTimer);
   }
 
   function fail() {
@@ -330,7 +337,6 @@ app.get("/api/soundcloud/stream", (req, res) => {
     }
   }
 
-  // Gửi header ngay khi có audio đầu tiên.
   function startResponse() {
     if (started) return;
 
@@ -343,43 +349,88 @@ app.get("/api/soundcloud/stream", (req, res) => {
     res.setHeader("X-Accel-Buffering", "no");
   }
 
-  // Lấy dữ liệu từ queue nhưng không làm mất dữ liệu
-  // trước khi res.write chấp nhận.
-  function peekChunk(maxBytes) {
-    if (bufferedBytes === 0) return null;
+  // Add data to FIFO queue
+  function enqueue(data) {
+    if (!data || data.length === 0) return;
 
-    const first = queue[queueIndex];
-    const length = Math.min(first.length, maxBytes);
-
-    return first.subarray(0, length);
+    queue.push(data);
+    bufferedBytes += data.length;
   }
 
-  function consumeChunk(length) {
-    while (length > 0 && queueIndex < queue.length) {
-      const first = queue[queueIndex];
+  // Consume only bytes accepted by res.write()
+  function consume(length) {
+    while (length > 0 && head < queue.length) {
+      const current = queue[head];
+      const available = current.length - headOffset;
 
-      if (length >= first.length) {
-        length -= first.length;
-        bufferedBytes -= first.length;
-        queueIndex++;
+      if (length >= available) {
+        length -= available;
+        bufferedBytes -= available;
+        head++;
+        headOffset = 0;
       } else {
-        queue[queueIndex] = first.subarray(length);
+        headOffset += length;
         bufferedBytes -= length;
         length = 0;
       }
     }
 
-    // Dọn các phần tử đã gửi.
-    if (queueIndex > 256) {
-      queue = queue.slice(queueIndex);
-      queueIndex = 0;
+    // Compact queue occasionally.
+    if (head >= 256) {
+      queue = queue.slice(head);
+      head = 0;
     }
   }
 
-  let waitingDrain = false;
+  // Get next FIFO chunk
+  function peek() {
+    if (head >= queue.length) return null;
 
-  // Phát liên tục ngay từ khi có dữ liệu đầu tiên.
-  function flushAudio() {
+    const current = queue[head];
+
+    return current.subarray(
+      headOffset,
+      Math.min(
+        current.length,
+        headOffset + SEND_CHUNK_BYTES
+      )
+    );
+  }
+
+  // Move pending bytes into available queue space.
+  function acceptPending() {
+    if (!pendingChunk) return;
+
+    const remaining =
+      pendingChunk.length - pendingOffset;
+
+    const freeSpace =
+      MAX_BUFFER_BYTES - bufferedBytes;
+
+    if (freeSpace <= 0) return;
+
+    const amount = Math.min(
+      remaining,
+      freeSpace
+    );
+
+    enqueue(
+      pendingChunk.subarray(
+        pendingOffset,
+        pendingOffset + amount
+      )
+    );
+
+    pendingOffset += amount;
+
+    if (pendingOffset >= pendingChunk.length) {
+      pendingChunk = null;
+      pendingOffset = 0;
+    }
+  }
+
+  // Main FIFO sender
+  function pump() {
     if (
       finished ||
       res.destroyed ||
@@ -387,104 +438,115 @@ app.get("/api/soundcloud/stream", (req, res) => {
       !started
     ) return;
 
-    while (bufferedBytes > 0) {
-      const chunk = peekChunk(SEND_CHUNK_BYTES);
+    while (!finished && !res.destroyed) {
 
-      if (!chunk) break;
+      // Always send oldest data first.
+      const chunk = peek();
 
-      const accepted = res.write(chunk);
+      if (chunk) {
+        const accepted = res.write(chunk);
 
-      // Node đã nhận dữ liệu, có thể bỏ khỏi queue.
-      consumeChunk(chunk.length);
+        // Node accepted these bytes.
+        // Remove them exactly once.
+        consume(chunk.length);
 
-      if (!accepted) {
-        waitingDrain = true;
+        if (!accepted) {
+          waitingDrain = true;
 
-        res.once("drain", () => {
-          waitingDrain = false;
-          flushAudio();
-        });
+          res.once("drain", () => {
+            waitingDrain = false;
+            pump();
+          });
 
-        return;
+          return;
+        }
+
+        continue;
       }
-    }
 
-    // Chỉ kết thúc khi nguồn đã hết và queue đã gửi hết.
-    if (sourceEnded && bufferedBytes === 0) {
-      finished = true;
-      cleanup();
+      // Queue is empty, accept pending bytes.
+      if (pendingChunk) {
+        acceptPending();
 
-      if (!res.destroyed && !res.writableEnded) {
-        res.end();
+        if (head < queue.length) {
+          continue;
+        }
+
+        if (pendingChunk) {
+          return;
+        }
       }
+
+      // Queue has space: allow source to continue.
+      if (
+        !sourceEnded &&
+        transcoder.stdout.isPaused()
+      ) {
+        transcoder.stdout.resume();
+      }
+
+      // End only after every byte has been sent.
+      if (
+        sourceEnded &&
+        bufferedBytes === 0 &&
+        pendingChunk === null
+      ) {
+        finished = true;
+        cleanup();
+
+        if (!res.destroyed && !res.writableEnded) {
+          res.end();
+        }
+      }
+
+      return;
     }
   }
 
   downloader.stderr.on("data", addError);
   transcoder.stderr.on("data", addError);
 
+  // Source -> FFmpeg
   downloader.stdout.pipe(transcoder.stdin);
 
   downloader.stdout.on("error", addError);
   transcoder.stdin.on("error", addError);
 
-  // Nhận dữ liệu MP3 liên tục.
+  // FFmpeg -> FIFO queue
   transcoder.stdout.on("data", chunk => {
     if (finished || res.destroyed) return;
 
-    const copy = Buffer.from(chunk);
-
-    // Không xóa dữ liệu cũ.
-    // Không ghi đè queue.
-    if (bufferedBytes + copy.length > MAX_BUFFER_BYTES) {
-      // Dừng đọc FFmpeg để backpressure truyền ngược
-      // tới downloader. Dữ liệu đã nhận vẫn được giữ.
-      transcoder.stdout.pause();
-
-      // Nếu vẫn vượt giới hạn thì không thể tiếp tục
-      // nhận thêm dữ liệu mà không tăng RAM.
-      // Chờ queue được gửi bớt rồi mới đọc tiếp.
-      pendingOverflow = copy;
-      return;
-    }
-
-    queue.push(copy);
-    bufferedBytes += copy.length;
+    const data = Buffer.from(chunk);
 
     startResponse();
-    flushAudio();
+
+    const freeSpace =
+      MAX_BUFFER_BYTES - bufferedBytes;
+
+    if (data.length <= freeSpace) {
+      enqueue(data);
+    } else {
+      // Fill remaining space first.
+      if (freeSpace > 0) {
+        enqueue(data.subarray(0, freeSpace));
+      }
+
+      // Preserve every remaining byte.
+      pendingChunk = data;
+      pendingOffset = freeSpace;
+
+      // Stop source immediately.
+      transcoder.stdout.pause();
+    }
+
+    pump();
   });
 
-  // Dữ liệu tạm khi queue chạm giới hạn.
-  let pendingOverflow = null;
-
-  function acceptPending() {
-    if (!pendingOverflow || finished) return;
-
-    if (
-      bufferedBytes + pendingOverflow.length <=
-      MAX_BUFFER_BYTES
-    ) {
-      queue.push(pendingOverflow);
-      bufferedBytes += pendingOverflow.length;
-      pendingOverflow = null;
-
-      startResponse();
-      flushAudio();
-
-      if (!transcoder.stdout.destroyed) {
-        transcoder.stdout.resume();
-      }
-    }
-  }
-
-  // Gửi theo nhịp ngắn, không giới hạn bitrate ở Node.js.
-  const sendTimer = setInterval(() => {
-    if (finished || res.destroyed) return;
-
-    flushAudio();
-    acceptPending();
-  }, 10);
+  // Resume after TCP backpressure.
+  res.on("drain", () => {
+    waitingDrain = false;
+    pump();
+  });
 
   downloader.on("error", err => {
     addError(err);
@@ -505,7 +567,7 @@ app.get("/api/soundcloud/stream", (req, res) => {
 
   transcoder.stdout.on("end", () => {
     sourceEnded = true;
-    flushAudio();
+    pump();
   });
 
   transcoder.on("close", code => {
@@ -518,10 +580,10 @@ app.get("/api/soundcloud/stream", (req, res) => {
     }
 
     sourceEnded = true;
-    flushAudio();
+    pump();
   });
 
-  const timer = setTimeout(() => {
+  timer = setTimeout(() => {
     addError("\nStream timeout");
     fail();
   }, 10 * 60 * 1000);
