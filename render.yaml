@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: youtube-api-server
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: YT_DLP_BIN
+        value: /usr/local/bin/yt-dlp
+      - key: YT_DLP_JS_RUNTIME
+        value: node
