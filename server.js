@@ -1,7 +1,8 @@
-
 const express = require("express");
 const cors = require("cors");
 const { spawn } = require("child_process");
+const https = require("https");
+const http = require("http");
 
 const app = express();
 app.use(cors());
@@ -9,384 +10,189 @@ app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 3000;
 const YTDLP = process.env.YTDLP_PATH || "yt-dlp";
-const FFMPEG = process.env.FFMPEG_PATH || "ffmpeg";
 
-const MAX_OUTPUT = 20 * 1024 * 1024;
-const TIMEOUT = 45000;
+const sessions = new Map();
 
-function validTrackUrl(value) {
-  try {
-    const u = new URL(value);
-    return (
-      u.protocol === "https:" &&
-      (u.hostname === "soundcloud.com" ||
-       u.hostname.endsWith(".soundcloud.com")) &&
-      !u.username &&
-      !u.password
-    );
-  } catch {
-    return false;
-  }
+function getStreamUrl(url) {
+    return new Promise((resolve, reject) => {
+        const args = [
+            "--no-warnings",
+            "--no-playlist",
+            "-f", "bestaudio",
+            "-g",
+            url
+        ];
+
+        const proc = spawn(YTDLP, args);
+        let output = "";
+        let error = "";
+
+        proc.stdout.on("data", d => output += d.toString());
+        proc.stderr.on("data", d => error += d.toString());
+
+        proc.on("error", reject);
+
+        proc.on("close", code => {
+            const streamUrl = output.trim().split(/\r?\n/)[0];
+
+            if (code !== 0 || !streamUrl) {
+                return reject(new Error(error || "Không lấy được stream URL"));
+            }
+
+            resolve(streamUrl);
+        });
+    });
 }
 
-// Run yt-dlp and receive JSON
-function runJson(args, res, transform = data => data) {
-  const child = spawn(YTDLP, args, {
-    stdio: ["ignore", "pipe", "pipe"]
-  });
+function stopSession(id) {
+    const session = sessions.get(id);
+    if (!session) return;
 
-  let stdout = "";
-  let stderr = "";
-  let finished = false;
+    session.stopped = true;
 
-  const timer = setTimeout(() => {
-    stderr += "\nProcess timeout";
-    child.kill("SIGKILL");
-  }, TIMEOUT);
-
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-
-  child.stdout.on("data", chunk => {
-    stdout += chunk;
-
-    if (stdout.length > MAX_OUTPUT) {
-      child.kill("SIGKILL");
+    if (session.request) {
+        session.request.destroy();
     }
-  });
 
-  child.stderr.on("data", chunk => {
-    stderr = (stderr + chunk).slice(-4000);
-  });
+    sessions.delete(id);
+}
 
-  child.on("error", err => {
-    if (finished) return;
-    finished = true;
-    clearTimeout(timer);
+// Lấy URL stream
+app.get("/stream-url", async (req, res) => {
+    try {
+        const url = req.query.url;
 
-    if (!res.headersSent) {
-      res.status(500).json({
-        success: false,
-        error: "Không chạy được yt-dlp.",
-        detail: err.message
-      });
+        if (!url) {
+            return res.status(400).json({
+                success: false,
+                error: "Thiếu URL"
+            });
+        }
+
+        const streamUrl = await getStreamUrl(url);
+
+        res.json({
+            success: true,
+            stream_url: streamUrl
+        });
+
+    } catch (e) {
+        res.status(500).json({
+            success: false,
+            error: e.message
+        });
     }
-  });
+});
 
-  child.on("close", code => {
-    if (finished) return;
-    finished = true;
-    clearTimeout(timer);
+// Phát MP3 trực tiếp qua server
+app.get("/stream", async (req, res) => {
+    const source = req.query.url;
+    const id = req.query.id || "default";
 
-    if (res.headersSent || res.destroyed) return;
-
-    if (code !== 0) {
-      return res.status(502).json({
-        success: false,
-        error: "SoundCloud không trả được dữ liệu.",
-        detail: stderr.slice(-1200)
-      });
+    if (!source) {
+        return res.status(400).send("Missing URL");
     }
+
+    stopSession(id);
+
+    const session = {
+        stopped: false,
+        request: null
+    };
+
+    sessions.set(id, session);
 
     try {
-      const data = JSON.parse(stdout);
-      res.json(transform(data));
-    } catch (err) {
-      res.status(502).json({
-        success: false,
-        error: "Không đọc được dữ liệu SoundCloud.",
-        detail: err.message
-      });
+        const streamUrl = await getStreamUrl(source);
+
+        if (session.stopped) return;
+
+        const client = streamUrl.startsWith("https:")
+            ? https
+            : http;
+
+        const upstream = client.get(streamUrl, {
+            headers: {
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "*/*"
+            }
+        }, upstreamRes => {
+
+            if (upstreamRes.statusCode < 200 ||
+                upstreamRes.statusCode >= 300) {
+                stopSession(id);
+
+                if (!res.headersSent) {
+                    res.status(502).end("Upstream error");
+                }
+                return;
+            }
+
+            res.status(200);
+            res.setHeader("Content-Type",
+                upstreamRes.headers["content-type"] || "audio/mpeg");
+
+            res.setHeader("Cache-Control", "no-cache, no-store");
+            res.setHeader("Accept-Ranges", "none");
+
+            // Không tự giới hạn bitrate.
+            // Không tích lũy toàn bộ bài hát.
+            // Chuyển tiếp theo cơ chế backpressure.
+            upstreamRes.pipe(res);
+
+            upstreamRes.on("error", () => {
+                res.destroy();
+                stopSession(id);
+            });
+
+            res.on("close", () => {
+                stopSession(id);
+            });
+        });
+
+        session.request = upstream;
+
+        upstream.on("error", err => {
+            if (!res.headersSent) {
+                res.status(502).send(err.message);
+            } else {
+                res.destroy();
+            }
+
+            stopSession(id);
+        });
+
+    } catch (e) {
+        stopSession(id);
+
+        if (!res.headersSent) {
+            res.status(500).json({
+                success: false,
+                error: e.message
+            });
+        }
     }
-  });
-
-  res.on("close", () => {
-    if (!finished) child.kill("SIGKILL");
-  });
-}
-
-// Normalize search results
-function normalizeTrack(x) {
-  const page = x.webpage_url ||
-    (typeof x.url === "string" && x.url.startsWith("https://soundcloud.com/")
-      ? x.url : null);
-
-  return {
-    id: x.id || null,
-    title: x.title || "Unknown",
-    artist: x.uploader || x.artist || x.creator || null,
-    duration: x.duration || null,
-    thumbnail: x.thumbnail || null,
-    url: page,
-    webpage_url: page
-  };
-}
-
-// Home
-app.get("/", (_req, res) => {
-  res.json({
-    name: "SoundCloud Audio API",
-    version: "2.0",
-    success: true,
-    cookiesRequired: false,
-    streaming: "AAC HLS -> MP3 128kbps",
-    endpoints: [
-      "/health",
-      "/api/soundcloud/search?q=lofi",
-      "/api/soundcloud/resolve?url=SOUNDCLOUD_TRACK_URL",
-      "/api/soundcloud/stream?url=SOUNDCLOUD_TRACK_URL"
-    ]
-  });
 });
 
-// Health
-app.get("/health", (_req, res) => {
-  res.json({
-    success: true,
-    service: "SoundCloud Audio API"
-  });
+// Dừng stream
+app.post("/stop", (req, res) => {
+    const id = req.body.id || "default";
+    stopSession(id);
+
+    res.json({ success: true });
 });
 
-// Search
-app.get("/api/soundcloud/search", (req, res) => {
-  const q = String(req.query.q || "").trim();
-
-  const limit = Math.min(
-    Math.max(parseInt(req.query.limit || "10", 10) || 10, 1),
-    25
-  );
-
-  if (!q) {
-    return res.status(400).json({
-      success: false,
-      error: "Thiếu từ khóa q."
-    });
-  }
-
-  runJson(
-    [
-      "--dump-single-json",
-      "--flat-playlist",
-      "--no-warnings",
-      "--no-check-formats",
-      `scsearch${limit}:${q}`
-    ],
-    res,
-    data => {
-      const entries = (data.entries || [])
-        .filter(Boolean)
-        .map(normalizeTrack)
-        .filter(x => x.webpage_url);
-
-      return {
+// Kiểm tra server
+app.get("/", (req, res) => {
+    res.json({
         success: true,
-        source: "SoundCloud",
-        count: entries.length,
-        results: entries
-      };
-    }
-  );
-});
-
-// Resolve track
-app.get("/api/soundcloud/resolve", (req, res) => {
-  const url = String(req.query.url || "");
-
-  if (!validTrackUrl(url)) {
-    return res.status(400).json({
-      success: false,
-      error: "URL SoundCloud không hợp lệ."
+        server: "SoundCloud Direct Stream",
+        mode: "HTTP streaming",
+        buffering: "Node.js backpressure",
+        bitrate_limit: false
     });
-  }
-
-  runJson(
-    [
-      "--dump-single-json",
-      "--no-warnings",
-      "--no-playlist",
-      "--no-check-formats",
-      url
-    ],
-    res,
-    d => ({
-      success: true,
-      id: d.id || null,
-      title: d.title || "Unknown",
-      artist: d.uploader || d.artist || null,
-      duration: d.duration || null,
-      thumbnail: d.thumbnail || null,
-      webpage_url: d.webpage_url || url,
-      stream_url:
-        "/api/soundcloud/stream?url=" +
-        encodeURIComponent(d.webpage_url || url),
-      cookiesRequired: false,
-      audioFormat: "AAC HLS",
-      outputFormat: "MP3 128kbps"
-    })
-  );
 });
 
-// Stream MP3 from SoundCloud AAC HLS
-app.get("/api/soundcloud/stream", (req, res) => {
-  const url = String(req.query.url || "");
-
-  if (!validTrackUrl(url)) {
-    return res.status(400).json({
-      success: false,
-      error: "URL SoundCloud không hợp lệ."
-    });
-  }
-
-  const downloader = spawn(
-    YTDLP,
-    [
-      "--no-warnings",
-      "--no-playlist",
-      "--no-part",
-      "--retries", "2",
-      "--fragment-retries", "2",
-      "--socket-timeout", "20",
-      "-f", "bestaudio/best",
-      "-o", "-",
-      url
-    ],
-    {
-      stdio: ["ignore", "pipe", "pipe"]
-    }
-  );
-
-  const transcoder = spawn(
-    FFMPEG,
-    [
-      "-hide_banner",
-      "-loglevel", "error",
-      "-i", "pipe:0",
-      "-map", "0:a:0",
-      "-vn",
-      "-ac", "2",
-      "-ar", "44100",
-      "-b:a", "128k",
-      "-f", "mp3",
-      "pipe:1"
-    ],
-    {
-      stdio: ["pipe", "pipe", "pipe"]
-    }
-  );
-
-  let started = false;
-  let finished = false;
-  let errors = "";
-
-  function addError(data) {
-    errors = (errors + data.toString()).slice(-4000);
-  }
-
-  function stopProcesses() {
-    if (downloader.exitCode === null) {
-      downloader.kill("SIGKILL");
-    }
-
-    if (transcoder.exitCode === null) {
-      transcoder.kill("SIGKILL");
-    }
-  }
-
-  function fail() {
-    if (finished) return;
-    finished = true;
-
-    stopProcesses();
-
-    if (!started && !res.headersSent && !res.destroyed) {
-      res.status(502).json({
-        success: false,
-        error: "Không phát được track này.",
-        detail: errors.slice(-1200)
-      });
-    } else if (!res.destroyed && !res.writableEnded) {
-      res.end();
-    }
-  }
-
-  downloader.stderr.on("data", addError);
-  transcoder.stderr.on("data", addError);
-
-  downloader.stdout.pipe(transcoder.stdin);
-
-  downloader.stdout.on("error", addError);
-  transcoder.stdin.on("error", addError);
-
-  transcoder.stdout.on("data", chunk => {
-    if (finished || res.destroyed) return;
-
-    if (!started) {
-      started = true;
-
-      res.status(200);
-      res.setHeader("Content-Type", "audio/mpeg");
-      res.setHeader("Cache-Control", "no-store");
-      res.setHeader("Accept-Ranges", "none");
-    }
-
-    if (!res.write(chunk)) {
-      transcoder.stdout.pause();
-
-      res.once("drain", () => {
-        transcoder.stdout.resume();
-      });
-    }
-  });
-
-  downloader.on("error", err => {
-    addError(err);
-    fail();
-  });
-
-  transcoder.on("error", err => {
-    addError(err);
-    fail();
-  });
-
-  downloader.on("close", code => {
-    if (code !== 0 && !finished) {
-      addError("\nyt-dlp exit code: " + code);
-      fail();
-    }
-  });
-
-  transcoder.on("close", code => {
-    if (finished) return;
-
-    if (code !== 0) {
-      addError("\nFFmpeg exit code: " + code);
-      fail();
-      return;
-    }
-
-    finished = true;
-
-    if (!res.destroyed && !res.writableEnded) {
-      res.end();
-    }
-  });
-
-  const timer = setTimeout(() => {
-    addError("\nStream timeout");
-    fail();
-  }, 10 * 60 * 1000);
-
-  res.on("close", () => {
-    clearTimeout(timer);
-
-    if (!res.writableEnded) {
-      finished = true;
-      stopProcesses();
-    }
-  });
-});
-
-// Start server
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("SoundCloud API listening on port " + PORT);
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
 });
