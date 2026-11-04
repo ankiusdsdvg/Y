@@ -1,48 +1,41 @@
-# YouTube Audio API Server
+# SoundCloud Audio API (không cần cookies)
 
-Node.js API tìm kiếm YouTube và phát **chỉ âm thanh MP3** qua server cho web player hoặc ESP32. Không tải video, không tạo luồng hình, không yêu cầu cấu hình cookies.
+API Node.js 20 dùng `yt-dlp` để tìm kiếm/lấy track SoundCloud công khai và FFmpeg để chuyển luồng âm thanh sang MP3. Không có chức năng tải video, không yêu cầu file cookies hay đăng nhập.
 
-## Chạy local
-
-Yêu cầu Node.js 20+, FFmpeg và yt-dlp đã cài, nằm trong PATH.
+## Chạy bằng Docker
 
 ```bash
-npm install
-npm start
-```
-
-Mở `http://localhost:10000/health`.
-
-## Chạy Docker
-
-```bash
-docker build -t youtube-audio-api .
-docker run --rm -p 10000:10000 -v youtube-data:/app/data youtube-audio-api
+docker build -t soundcloud-audio-api .
+docker run --rm -p 3000:3000 soundcloud-audio-api
 ```
 
 ## API
 
-- `GET /api/youtube/search?q=lofi&limit=10&deviceId=esp32` — tìm bài hát/video trên YouTube.
-- `GET /api/youtube/info?id=VIDEO_ID` — thông tin bài.
-- `GET /api/youtube/stream?id=VIDEO_ID&type=audio` — lấy URL audio trực tiếp (có thể hết hạn).
-- `GET /api/youtube/audio/VIDEO_ID.mp3` — chuyển audio sang MP3 128 kbps và stream qua server.
-- `GET /api/youtube/watch?id=VIDEO_ID` — trả về URL audio-only tương thích route cũ; không có video.
-- `GET /api/youtube/history?deviceId=esp32&limit=20`
-- `POST /api/youtube/history` JSON: `{"deviceId":"esp32","videoId":"VIDEO_ID","title":"Tên bài","channel":"Kênh"}`
-- `GET /api/youtube/favorites?deviceId=esp32`
-- `POST /api/youtube/favorites` cùng JSON như history.
-- `DELETE /api/youtube/favorites/VIDEO_ID?deviceId=esp32`
+- `GET /health`
+- `GET /api/soundcloud/search?q=lofi&limit=10`
+- `GET /api/soundcloud/resolve?url=https%3A%2F%2Fsoundcloud.com%2F...`
+- `GET /api/soundcloud/stream?url=https%3A%2F%2Fsoundcloud.com%2F...`
 
-## Phát trên ESP32 / trình duyệt
+Ví dụ:
+```bash
+curl "http://localhost:3000/api/soundcloud/search?q=lofi"
+```
 
-Sau khi tìm kiếm, lấy `videoId` của kết quả rồi phát URL:
+Lấy `webpage_url` từ kết quả tìm kiếm rồi gọi:
+```text
+http://localhost:3000/api/soundcloud/stream?url=ENCODED_TRACK_URL
+```
 
-`http://YOUR_SERVER:10000/api/youtube/audio/VIDEO_ID.mp3`
+Endpoint stream trả `audio/mpeg` MP3 128 kbps dạng stream, phù hợp để ESP32 đọc bằng HTTP audio client có hỗ trợ MP3.
 
-Đầu ra là MP3 128 kbps, chỉ có tiếng. Không cần tải hoặc giải mã hình ảnh.
+## Deploy Render
 
-## Cookies và giới hạn
+Tạo Web Service từ GitHub repo chứa project này. Chọn Docker; Render sẽ tự dùng `Dockerfile` và `render.yaml`. Sau khi deploy, dùng URL service thay `http://localhost:3000`.
 
-Server không đọc, không truyền và không yêu cầu file cookies. yt-dlp sẽ thử truy cập nội dung công khai mà không đăng nhập. Tuy nhiên, YouTube đôi khi vẫn yêu cầu xác minh bot, giới hạn khu vực hoặc đăng nhập đối với một số video; những trường hợp đó không thể đảm bảo phát được nếu không có quyền truy cập hợp lệ. Không có cách hợp pháp/đáng tin cậy để cam kết mọi video đều phát mà không xác thực.
+## Lưu ý
 
-Proxy MP3 dùng CPU và băng thông của server. Chỉ sử dụng nội dung bạn có quyền truy cập và phát lại; server không vượt DRM hoặc quyền truy cập.
+- Không cần cookies cho track công khai mà SoundCloud cho phép truy cập.
+- Track riêng tư, bị giới hạn theo khu vực/quyền, yêu cầu đăng nhập hoặc bị SoundCloud chặn có thể không phát được.
+- SoundCloud có thể thay đổi cơ chế truy cập; cập nhật yt-dlp khi extractor ngừng hoạt động.
+- Chỉ sử dụng nội dung bạn có quyền nghe/phát và tuân thủ điều khoản SoundCloud, bản quyền và giới hạn API.
+- Endpoint stream tiêu thụ băng thông của server; nên đặt giới hạn request/rate limit nếu public.
