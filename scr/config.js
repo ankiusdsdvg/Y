@@ -6,7 +6,6 @@ module.exports = {
   dbPath: process.env.DB_PATH || path.join(process.cwd(), "data", "youtube.sqlite"),
   ytDlpBin: process.env.YT_DLP_BIN || "yt-dlp",
   ytDlpJsRuntime: process.env.YT_DLP_JS_RUNTIME || "",
-  ytCookies: process.env.YOUTUBE_COOKIES || "",
   searchTimeoutMs: Number(process.env.SEARCH_TIMEOUT_MS || 25000),
   extractTimeoutMs: Number(process.env.EXTRACT_TIMEOUT_MS || 30000),
   maxSearch: 20
