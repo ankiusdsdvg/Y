@@ -295,6 +295,7 @@ app.get("/api/soundcloud/stream", (req, res) => {
   function fail() {
     if (finished) return;
     finished = true;
+    clearInterval(streamBufferTimer);
 
     stopProcesses();
 
@@ -317,26 +318,55 @@ app.get("/api/soundcloud/stream", (req, res) => {
   downloader.stdout.on("error", addError);
   transcoder.stdin.on("error", addError);
 
-  transcoder.stdout.on("data", chunk => {
-    if (finished || res.destroyed) return;
+  const STREAM_CHUNK_BYTES = 32 * 1024;
+  const STREAM_MAX_BUFFER_BYTES = 20 * 16 * 1024; // ~20s playback buffer @ ~128kbps MP3
+  let pendingAudio = Buffer.alloc(0);
+
+  function flushAudioChunk() {
+    if (finished || res.destroyed || pendingAudio.length === 0) return;
 
     if (!started) {
       started = true;
-
       res.status(200);
       res.setHeader("Content-Type", "audio/mpeg");
       res.setHeader("Cache-Control", "no-store");
       res.setHeader("Accept-Ranges", "none");
     }
 
-    if (!res.write(chunk)) {
-      transcoder.stdout.pause();
+    const toWrite = pendingAudio.subarray(0, Math.min(STREAM_CHUNK_BYTES, pendingAudio.length));
+    pendingAudio = pendingAudio.subarray(toWrite.length);
 
+    if (!res.write(toWrite)) {
+      transcoder.stdout.pause();
       res.once("drain", () => {
         transcoder.stdout.resume();
       });
     }
+  }
+
+  transcoder.stdout.on("data", chunk => {
+    if (finished || res.destroyed) return;
+
+    const nextChunk = Buffer.from(chunk);
+    if (pendingAudio.length + nextChunk.length > STREAM_MAX_BUFFER_BYTES) {
+      const keepBytes = Math.max(0, STREAM_MAX_BUFFER_BYTES - pendingAudio.length);
+      if (keepBytes > 0) {
+        pendingAudio = Buffer.concat([pendingAudio, nextChunk.subarray(0, keepBytes)]);
+      } else {
+        pendingAudio = Buffer.alloc(0);
+      }
+      addError("\nStream buffer overflow, dropping stale audio");
+      return;
+    }
+
+    pendingAudio = Buffer.concat([pendingAudio, nextChunk]);
   });
+
+  const streamBufferTimer = setInterval(() => {
+    if (!finished && !res.destroyed) {
+      flushAudioChunk();
+    }
+  }, 200);
 
   downloader.on("error", err => {
     addError(err);
@@ -355,7 +385,23 @@ app.get("/api/soundcloud/stream", (req, res) => {
     }
   });
 
+  const timer = setTimeout(() => {
+    addError("\nStream timeout");
+    fail();
+  }, 10 * 60 * 1000);
+
+  res.on("close", () => {
+    clearTimeout(timer);
+    clearInterval(streamBufferTimer);
+
+    if (!res.writableEnded) {
+      finished = true;
+      stopProcesses();
+    }
+  });
+
   transcoder.on("close", code => {
+    clearInterval(streamBufferTimer);
     if (finished) return;
 
     if (code !== 0) {
@@ -366,22 +412,15 @@ app.get("/api/soundcloud/stream", (req, res) => {
 
     finished = true;
 
+    while (pendingAudio.length > 0) {
+      flushAudioChunk();
+      if (pendingAudio.length > 0) {
+        break;
+      }
+    }
+
     if (!res.destroyed && !res.writableEnded) {
       res.end();
-    }
-  });
-
-  const timer = setTimeout(() => {
-    addError("\nStream timeout");
-    fail();
-  }, 10 * 60 * 1000);
-
-  res.on("close", () => {
-    clearTimeout(timer);
-
-    if (!res.writableEnded) {
-      finished = true;
-      stopProcesses();
     }
   });
 });
