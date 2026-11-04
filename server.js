@@ -318,12 +318,11 @@ app.get("/api/soundcloud/stream", (req, res) => {
   downloader.stdout.on("error", addError);
   transcoder.stdin.on("error", addError);
 
-  // MP3 128 kbps ~= 16 KB/s. We keep a small safety cushion above that so the ESP
-  // sees a steady stream without trying to read the whole buffer in a burst and then stalling.
-  // Too fast => fast-forward / gaps. Too slow => underflow. The rate below is about 32 KB/s.
-  const STREAM_CHUNK_BYTES = 8 * 1024;
-  const STREAM_FLUSH_MS = 200;
-  const STREAM_MAX_BUFFER_BYTES = 96 * 1024; // roughly 3s of headroom at 128 kbps
+  // Giống cách Zing phát: giữ đệm server rất nhỏ, chỉ đủ chống giật mạng, không quản lý
+  // cả một queue dài như file. ESP tự decode; server chỉ cần phát đều theo nhịp ổn định.
+  const STREAM_CHUNK_BYTES = 4 * 1024;
+  const STREAM_FLUSH_MS = 100;
+  const STREAM_MAX_BUFFER_BYTES = 32 * 1024; // khoảng 2 giây ở 128 kbps, đủ mềm nhưng không "vượt nhịp"
   let pendingAudio = Buffer.alloc(0);
 
   function flushAudioChunk() {
@@ -352,17 +351,20 @@ app.get("/api/soundcloud/stream", (req, res) => {
     if (finished || res.destroyed) return;
 
     const nextChunk = Buffer.from(chunk);
-    const merged = Buffer.concat([pendingAudio, nextChunk]);
-    if (merged.length > STREAM_MAX_BUFFER_BYTES) {
-      // Never clear the whole queue: that would drop the current playback position and create the
-      // jump-from-5s-to-15s symptom. Keep the newest tail of the stream instead and discard only stale data.
-      const excess = merged.length - STREAM_MAX_BUFFER_BYTES;
-      pendingAudio = merged.subarray(excess);
-      addError("\nStream buffer overflow, trimming stale audio");
+    const mergedSize = pendingAudio.length + nextChunk.length;
+    if (mergedSize <= STREAM_MAX_BUFFER_BYTES) {
+      pendingAudio = Buffer.concat([pendingAudio, nextChunk]);
       return;
     }
 
-    pendingAudio = merged;
+    // Giữ phần mới nhất: không xóa toàn bộ queue, không làm mất vị trí phát hiện tại.
+    // Đây là cách tương tự Zing: server luôn giữ buffer ngắn, và ESP đọc liên tục theo nhịp.
+    const keepTail = Math.max(0, STREAM_MAX_BUFFER_BYTES - nextChunk.length);
+    if (keepTail > 0) {
+      pendingAudio = Buffer.concat([pendingAudio.subarray(pendingAudio.length - keepTail), nextChunk]);
+    } else {
+      pendingAudio = Buffer.from(nextChunk);
+    }
   });
 
   const streamBufferTimer = setInterval(() => {
