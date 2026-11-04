@@ -352,18 +352,17 @@ app.get("/api/soundcloud/stream", (req, res) => {
     if (finished || res.destroyed) return;
 
     const nextChunk = Buffer.from(chunk);
-    if (pendingAudio.length + nextChunk.length > STREAM_MAX_BUFFER_BYTES) {
-      const keepBytes = Math.max(0, STREAM_MAX_BUFFER_BYTES - pendingAudio.length);
-      if (keepBytes > 0) {
-        pendingAudio = Buffer.concat([pendingAudio, nextChunk.subarray(0, keepBytes)]);
-      } else {
-        pendingAudio = Buffer.alloc(0);
-      }
-      addError("\nStream buffer overflow, dropping stale audio");
+    const merged = Buffer.concat([pendingAudio, nextChunk]);
+    if (merged.length > STREAM_MAX_BUFFER_BYTES) {
+      // Never clear the whole queue: that would drop the current playback position and create the
+      // jump-from-5s-to-15s symptom. Keep the newest tail of the stream instead and discard only stale data.
+      const excess = merged.length - STREAM_MAX_BUFFER_BYTES;
+      pendingAudio = merged.subarray(excess);
+      addError("\nStream buffer overflow, trimming stale audio");
       return;
     }
 
-    pendingAudio = Buffer.concat([pendingAudio, nextChunk]);
+    pendingAudio = merged;
   });
 
   const streamBufferTimer = setInterval(() => {
