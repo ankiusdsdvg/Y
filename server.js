@@ -226,9 +226,7 @@ app.get("/api/soundcloud/resolve", (req, res) => {
   );
 });
 
-// ============================================
-// STREAM - FIFO QUEUE / NO DATA LOSS
-// ============================================
+// Stream MP3 from SoundCloud AAC HLS
 app.get("/api/soundcloud/stream", (req, res) => {
   const url = String(req.query.url || "");
 
@@ -278,52 +276,26 @@ app.get("/api/soundcloud/stream", (req, res) => {
 
   let started = false;
   let finished = false;
-  let sourceEnded = false;
-  let waitingDrain = false;
   let errors = "";
-
-  // Maximum RAM queue: 32 MB
-  const MAX_BUFFER_BYTES = 32 * 1024 * 1024;
-
-  // HTTP write chunk
-  const SEND_CHUNK_BYTES = 16 * 1024;
-
-  // FIFO queue
-  let queue = [];
-  let head = 0;
-  let headOffset = 0;
-  let bufferedBytes = 0;
-
-  // Only one overflow chunk is allowed.
-  // Source is paused immediately while it is pending.
-  let pendingChunk = null;
-  let pendingOffset = 0;
-
-  let timer;
 
   function addError(data) {
     errors = (errors + data.toString()).slice(-4000);
   }
 
   function stopProcesses() {
-    if (downloader.exitCode === null && !downloader.killed) {
+    if (downloader.exitCode === null) {
       downloader.kill("SIGKILL");
     }
 
-    if (transcoder.exitCode === null && !transcoder.killed) {
+    if (transcoder.exitCode === null) {
       transcoder.kill("SIGKILL");
     }
   }
 
-  function cleanup() {
-    clearTimeout(timer);
-  }
-
   function fail() {
     if (finished) return;
-
     finished = true;
-    cleanup();
+
     stopProcesses();
 
     if (!started && !res.headersSent && !res.destroyed) {
@@ -337,215 +309,33 @@ app.get("/api/soundcloud/stream", (req, res) => {
     }
   }
 
-  function startResponse() {
-    if (started) return;
-
-    started = true;
-
-    res.status(200);
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Cache-Control", "no-store, no-cache");
-    res.setHeader("Accept-Ranges", "none");
-    res.setHeader("X-Accel-Buffering", "no");
-  }
-
-  // Add data to FIFO queue
-  function enqueue(data) {
-    if (!data || data.length === 0) return;
-
-    queue.push(data);
-    bufferedBytes += data.length;
-  }
-
-  // Consume only bytes accepted by res.write()
-  function consume(length) {
-    while (length > 0 && head < queue.length) {
-      const current = queue[head];
-      const available = current.length - headOffset;
-
-      if (length >= available) {
-        length -= available;
-        bufferedBytes -= available;
-        head++;
-        headOffset = 0;
-      } else {
-        headOffset += length;
-        bufferedBytes -= length;
-        length = 0;
-      }
-    }
-
-    // Compact queue occasionally.
-    if (head >= 256) {
-      queue = queue.slice(head);
-      head = 0;
-    }
-  }
-
-  // Get next FIFO chunk
-  function peek() {
-    if (head >= queue.length) return null;
-
-    const current = queue[head];
-
-    return current.subarray(
-      headOffset,
-      Math.min(
-        current.length,
-        headOffset + SEND_CHUNK_BYTES
-      )
-    );
-  }
-
-  // Move pending bytes into available queue space.
-  function acceptPending() {
-    if (!pendingChunk) return;
-
-    const remaining =
-      pendingChunk.length - pendingOffset;
-
-    const freeSpace =
-      MAX_BUFFER_BYTES - bufferedBytes;
-
-    if (freeSpace <= 0) return;
-
-    const amount = Math.min(
-      remaining,
-      freeSpace
-    );
-
-    enqueue(
-      pendingChunk.subarray(
-        pendingOffset,
-        pendingOffset + amount
-      )
-    );
-
-    pendingOffset += amount;
-
-    if (pendingOffset >= pendingChunk.length) {
-      pendingChunk = null;
-      pendingOffset = 0;
-    }
-  }
-
-  // Main FIFO sender
-  function pump() {
-    if (
-      finished ||
-      res.destroyed ||
-      waitingDrain ||
-      !started
-    ) return;
-
-    while (!finished && !res.destroyed) {
-
-      // Always send oldest data first.
-      const chunk = peek();
-
-      if (chunk) {
-        const accepted = res.write(chunk);
-
-        // Node accepted these bytes.
-        // Remove them exactly once.
-        consume(chunk.length);
-
-        if (!accepted) {
-          waitingDrain = true;
-
-          res.once("drain", () => {
-            waitingDrain = false;
-            pump();
-          });
-
-          return;
-        }
-
-        continue;
-      }
-
-      // Queue is empty, accept pending bytes.
-      if (pendingChunk) {
-        acceptPending();
-
-        if (head < queue.length) {
-          continue;
-        }
-
-        if (pendingChunk) {
-          return;
-        }
-      }
-
-      // Queue has space: allow source to continue.
-      if (
-        !sourceEnded &&
-        transcoder.stdout.isPaused()
-      ) {
-        transcoder.stdout.resume();
-      }
-
-      // End only after every byte has been sent.
-      if (
-        sourceEnded &&
-        bufferedBytes === 0 &&
-        pendingChunk === null
-      ) {
-        finished = true;
-        cleanup();
-
-        if (!res.destroyed && !res.writableEnded) {
-          res.end();
-        }
-      }
-
-      return;
-    }
-  }
-
   downloader.stderr.on("data", addError);
   transcoder.stderr.on("data", addError);
 
-  // Source -> FFmpeg
   downloader.stdout.pipe(transcoder.stdin);
 
   downloader.stdout.on("error", addError);
   transcoder.stdin.on("error", addError);
 
-  // FFmpeg -> FIFO queue
   transcoder.stdout.on("data", chunk => {
     if (finished || res.destroyed) return;
 
-    const data = Buffer.from(chunk);
+    if (!started) {
+      started = true;
 
-    startResponse();
-
-    const freeSpace =
-      MAX_BUFFER_BYTES - bufferedBytes;
-
-    if (data.length <= freeSpace) {
-      enqueue(data);
-    } else {
-      // Fill remaining space first.
-      if (freeSpace > 0) {
-        enqueue(data.subarray(0, freeSpace));
-      }
-
-      // Preserve every remaining byte.
-      pendingChunk = data;
-      pendingOffset = freeSpace;
-
-      // Stop source immediately.
-      transcoder.stdout.pause();
+      res.status(200);
+      res.setHeader("Content-Type", "audio/mpeg");
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("Accept-Ranges", "none");
     }
 
-    pump();
-  });
+    if (!res.write(chunk)) {
+      transcoder.stdout.pause();
 
-  // Resume after TCP backpressure.
-  res.on("drain", () => {
-    waitingDrain = false;
-    pump();
+      res.once("drain", () => {
+        transcoder.stdout.resume();
+      });
+    }
   });
 
   downloader.on("error", err => {
@@ -565,11 +355,6 @@ app.get("/api/soundcloud/stream", (req, res) => {
     }
   });
 
-  transcoder.stdout.on("end", () => {
-    sourceEnded = true;
-    pump();
-  });
-
   transcoder.on("close", code => {
     if (finished) return;
 
@@ -579,17 +364,20 @@ app.get("/api/soundcloud/stream", (req, res) => {
       return;
     }
 
-    sourceEnded = true;
-    pump();
+    finished = true;
+
+    if (!res.destroyed && !res.writableEnded) {
+      res.end();
+    }
   });
 
-  timer = setTimeout(() => {
+  const timer = setTimeout(() => {
     addError("\nStream timeout");
     fail();
   }, 10 * 60 * 1000);
 
   res.on("close", () => {
-    cleanup();
+    clearTimeout(timer);
 
     if (!res.writableEnded) {
       finished = true;
