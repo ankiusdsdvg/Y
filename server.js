@@ -318,8 +318,11 @@ app.get("/api/soundcloud/stream", (req, res) => {
   downloader.stdout.on("error", addError);
   transcoder.stdin.on("error", addError);
 
-  const STREAM_CHUNK_BYTES = 32 * 1024;
-  const STREAM_MAX_BUFFER_BYTES = 20 * 16 * 1024; // ~20s playback buffer @ ~128kbps MP3
+  // 128 kbps MP3 ~= 16 KB/s. The old path pushed ~160 KB/s (32 KB every 200 ms),
+  // which made the ESP read too fast and behave like a fast-forward / bursty stream.
+  const STREAM_CHUNK_BYTES = 4 * 1024;
+  const STREAM_FLUSH_MS = 250;
+  const STREAM_MAX_BUFFER_BYTES = 64 * 1024; // ~4s playback buffer @ ~128kbps MP3
   let pendingAudio = Buffer.alloc(0);
 
   function flushAudioChunk() {
@@ -366,7 +369,7 @@ app.get("/api/soundcloud/stream", (req, res) => {
     if (!finished && !res.destroyed) {
       flushAudioChunk();
     }
-  }, 200);
+  }, STREAM_FLUSH_MS);
 
   downloader.on("error", err => {
     addError(err);
