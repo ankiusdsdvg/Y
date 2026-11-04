@@ -2,10 +2,11 @@
   "name": "youtube-api-server",
   "version": "1.0.0",
   "private": true,
-  "main": "scr/server.js",
+  "description": "YouTube search and audio API server for web players and ESP32 clients",
+  "main": "src/server.js",
   "scripts": {
-    "start": "node scr/server.js",
-    "dev": "node --watch scr/server.js"
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
   },
   "engines": {
     "node": "20.x"
