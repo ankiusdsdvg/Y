@@ -1,4 +1,3 @@
-
 const express = require("express");
 const cors = require("cors");
 const { spawn } = require("child_process");
@@ -277,7 +276,6 @@ app.get("/api/soundcloud/stream", (req, res) => {
   let started = false;
   let finished = false;
   let sourceEnded = false;
-  let waitingDrain = false;
   let errors = "";
 
   function addError(data) {
@@ -285,24 +283,24 @@ app.get("/api/soundcloud/stream", (req, res) => {
   }
 
   function stopProcesses() {
-    if (downloader.exitCode === null && !downloader.killed) {
+    if (downloader.exitCode === null) {
       downloader.kill("SIGKILL");
     }
 
-    if (transcoder.exitCode === null && !transcoder.killed) {
+    if (transcoder.exitCode === null) {
       transcoder.kill("SIGKILL");
     }
   }
 
   function cleanup() {
-    clearInterval(streamBufferTimer);
     clearTimeout(timer);
+    clearInterval(streamBufferTimer);
   }
 
   function fail() {
     if (finished) return;
-
     finished = true;
+
     cleanup();
     stopProcesses();
 
@@ -317,121 +315,77 @@ app.get("/api/soundcloud/stream", (req, res) => {
     }
   }
 
+  downloader.stderr.on("data", addError);
+  transcoder.stderr.on("data", addError);
+
+  downloader.stdout.pipe(transcoder.stdin);
+
+  downloader.stdout.on("error", addError);
+  transcoder.stdin.on("error", addError);
+
   // =====================================
-  // BUFFER FIFO - 120 GIÂY
+  // BUFFER 2 PHÚT - VỪA PHÁT VỪA ĐỆM
   // =====================================
 
-  const BITRATE = 128000;
+  const STREAM_CHUNK_BYTES = 3200;
 
-  // 2 phút = 1.920.000 bytes ở 128kbps
-  const BUFFER_SECONDS = 120;
+  // 128kbps = 16KB/s
+  // 120 giây = 1.920.000 bytes
+  const STREAM_MAX_BUFFER_BYTES =
+    120 * 16000;
 
-  const MAX_BUFFER_BYTES =
-    Math.floor((BITRATE / 8) * BUFFER_SECONDS);
+  const STREAM_RESUME_BUFFER_BYTES =
+    STREAM_MAX_BUFFER_BYTES * 0.75;
 
-  // Gửi 1.600 bytes mỗi 100ms = 128kbps
-  const SEND_CHUNK_BYTES = 1600;
-  const SEND_INTERVAL_MS = 100;
+  let pendingAudio = Buffer.alloc(0);
 
-  const RESUME_BUFFER_BYTES =
-    Math.floor(MAX_BUFFER_BYTES * 0.75);
-
-  let audioQueue = [];
-  let queueIndex = 0;
-  let queueOffset = 0;
-  let queuedBytes = 0;
-
-  function startStream() {
-    if (started || finished || res.destroyed) return;
-
-    started = true;
-
-    res.status(200);
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Cache-Control", "no-store");
-    res.setHeader("Accept-Ranges", "none");
-  }
-
-  // Thêm dữ liệu vào FIFO
-  function addAudio(chunk) {
+  function flushAudioChunk() {
     if (finished || res.destroyed) return;
 
-    audioQueue.push(Buffer.from(chunk));
-    queuedBytes += chunk.length;
+    if (pendingAudio.length > 0) {
 
-    // Đủ 2 phút thì tạm dừng đọc nguồn.
-    // Không xóa hoặc bỏ dữ liệu.
-    if (queuedBytes >= MAX_BUFFER_BYTES) {
-      transcoder.stdout.pause();
-    }
-  }
+      if (!started) {
+        started = true;
+        res.status(200);
+        res.setHeader("Content-Type", "audio/mpeg");
+        res.setHeader("Cache-Control", "no-store");
+        res.setHeader("Accept-Ranges", "none");
+      }
 
-  // Lấy dữ liệu FIFO theo đúng thứ tự
-  function getAudio(maxBytes) {
-    if (queuedBytes <= 0) return null;
-
-    const length = Math.min(maxBytes, queuedBytes);
-    const output = Buffer.allocUnsafe(length);
-
-    let written = 0;
-
-    while (written < length) {
-      const current = audioQueue[queueIndex];
-
-      const available = current.length - queueOffset;
-      const take = Math.min(available, length - written);
-
-      current.copy(
-        output,
-        written,
-        queueOffset,
-        queueOffset + take
+      const toWrite = pendingAudio.subarray(
+        0,
+        Math.min(STREAM_CHUNK_BYTES, pendingAudio.length)
       );
 
-      written += take;
-      queueOffset += take;
-      queuedBytes -= take;
+      pendingAudio = pendingAudio.subarray(toWrite.length);
 
-      if (queueOffset >= current.length) {
-        queueIndex++;
-        queueOffset = 0;
+      if (!res.write(toWrite)) {
+        transcoder.stdout.pause();
+
+        res.once("drain", () => {
+          if (!finished && !res.destroyed) {
+            if (
+              pendingAudio.length <= STREAM_RESUME_BUFFER_BYTES &&
+              !sourceEnded
+            ) {
+              transcoder.stdout.resume();
+            }
+          }
+        });
       }
     }
 
-    // Dọn mảng đã sử dụng
-    if (queueIndex > 100) {
-      audioQueue = audioQueue.slice(queueIndex);
-      queueIndex = 0;
-    }
-
-    // Khi buffer giảm xuống 75%, tiếp tục tải nguồn
+    // Buffer đã giảm, tiếp tục tải dữ liệu nguồn
     if (
       transcoder.stdout.isPaused() &&
-      queuedBytes <= RESUME_BUFFER_BYTES &&
+      pendingAudio.length <= STREAM_RESUME_BUFFER_BYTES &&
       !sourceEnded
     ) {
       transcoder.stdout.resume();
     }
 
-    return output;
-  }
-
-  // Gửi âm thanh theo tốc độ 128kbps
-  function flushAudioChunk() {
-    if (finished || res.destroyed || !started) return;
-
-    if (waitingDrain) return;
-
-    const chunk = getAudio(SEND_CHUNK_BYTES);
-
-    if (chunk && chunk.length > 0) {
-      if (!res.write(chunk)) {
-        waitingDrain = true;
-      }
-    }
-
-    // Nguồn đã kết thúc và FIFO đã phát hết
-    if (sourceEnded && queuedBytes === 0) {
+    // Đã tải hết và gửi hết dữ liệu
+    if (sourceEnded && pendingAudio.length === 0) {
       finished = true;
       cleanup();
 
@@ -441,38 +395,30 @@ app.get("/api/soundcloud/stream", (req, res) => {
     }
   }
 
-  // =====================================
-  // DOWNLOAD + TRANSCODE
-  // =====================================
-
-  downloader.stderr.on("data", addError);
-  transcoder.stderr.on("data", addError);
-
-  downloader.stdout.pipe(transcoder.stdin);
-
-  downloader.stdout.on("error", addError);
-  transcoder.stdin.on("error", addError);
-
   transcoder.stdout.on("data", chunk => {
     if (finished || res.destroyed) return;
 
-    if (!started) {
-      startStream();
+    const nextChunk = Buffer.from(chunk);
+
+    // Không bỏ dữ liệu khi buffer đầy
+    pendingAudio = Buffer.concat([
+      pendingAudio,
+      nextChunk
+    ]);
+
+    // Đủ 2 phút thì tạm dừng đọc nguồn.
+    // Khi buffer giảm sẽ tự tiếp tục.
+    if (pendingAudio.length >= STREAM_MAX_BUFFER_BYTES) {
+      transcoder.stdout.pause();
     }
-
-    addAudio(chunk);
   });
 
-  // Bắt đầu gửi ngay khi có dữ liệu đầu tiên.
-  // Không đợi đủ 2 phút.
+  // Gửi đều trong lúc phát, không chờ đủ 2 phút
   const streamBufferTimer = setInterval(() => {
-    flushAudioChunk();
-  }, SEND_INTERVAL_MS);
-
-  // Nếu socket sẵn sàng gửi tiếp
-  res.on("drain", () => {
-    waitingDrain = false;
-  });
+    if (!finished && !res.destroyed) {
+      flushAudioChunk();
+    }
+  }, 200);
 
   downloader.on("error", err => {
     addError(err);
@@ -491,6 +437,11 @@ app.get("/api/soundcloud/stream", (req, res) => {
     }
   });
 
+  transcoder.stdout.on("end", () => {
+    sourceEnded = true;
+    flushAudioChunk();
+  });
+
   transcoder.on("close", code => {
     if (finished) return;
 
@@ -501,33 +452,19 @@ app.get("/api/soundcloud/stream", (req, res) => {
     }
 
     sourceEnded = true;
-
-    if (!started) {
-      fail();
-      return;
-    }
-
-    // Nếu FIFO đã hết thì kết thúc ngay
-    if (queuedBytes === 0) {
-      finished = true;
-      cleanup();
-
-      if (!res.destroyed && !res.writableEnded) {
-        res.end();
-      }
-    }
+    flushAudioChunk();
   });
 
-  // Timeout 10 phút như code ban đầu
   const timer = setTimeout(() => {
     addError("\nStream timeout");
     fail();
   }, 10 * 60 * 1000);
 
   res.on("close", () => {
+    cleanup();
+
     if (!res.writableEnded) {
       finished = true;
-      cleanup();
       stopProcesses();
     }
   });
