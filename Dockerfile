@@ -1,11 +1,31 @@
-FROM node:20-bookworm-slim
+
+FROM node:22-bookworm-slim
+
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip ffmpeg ca-certificates \
-    && pip3 install --break-system-packages --no-cache-dir -U yt-dlp \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Install FFmpeg and Python
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    python3 \
+    python3-pip \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install yt-dlp
+RUN pip3 install --no-cache-dir --break-system-packages yt-dlp
+
+# Install Node dependencies
 COPY package*.json ./
 RUN npm install --omit=dev
-COPY . .
+
+# Copy server
+COPY server.js .
+
 ENV NODE_ENV=production
+ENV PORT=3000
+ENV YTDLP_PATH=yt-dlp
+ENV FFMPEG_PATH=ffmpeg
+
 EXPOSE 3000
-CMD ["npm", "start"]
+
+CMD ["node", "server.js"]
