@@ -1,7 +1,7 @@
 const { spawn } = require("node:child_process");
 const ytSearch = require("yt-search");
 const {
-  ytDlpBin, ytDlpJsRuntime, searchTimeoutMs, extractTimeoutMs, maxSearch
+  ytDlpBin, ytDlpJsRuntime, ytCookies, searchTimeoutMs, extractTimeoutMs, maxSearch
 } = require("./config");
 
 function videoUrl(id) {
@@ -20,6 +20,7 @@ function formatDuration(value) {
 function baseArgs() {
   const args = ["--ignore-config", "--no-warnings", "--no-progress"];
   if (ytDlpJsRuntime) args.push("--js-runtimes", ytDlpJsRuntime);
+  if (ytCookies) args.push("--cookies", ytCookies);
   return args;
 }
 function runYtDlp(args, timeoutMs = extractTimeoutMs, maxBytes = 8 * 1024 * 1024) {
@@ -141,8 +142,7 @@ async function getVideoInfo(id) {
 }
 async function getStreamInfo(id, kind = "audio") {
   const url = videoUrl(String(id || "").trim());
-  const format = "bestaudio[protocol^=https]/bestaudio";
-  kind = "audio";
+  const format = kind === "video" ? "best[protocol^=https]/best" : "bestaudio[protocol^=https]/bestaudio";
   const output = await runYtDlp([...baseArgs(), "--no-playlist", "-f", format, "--get-url", url]);
   const lines = output.trim().split(/\r?\n/);
   const streamUrl = lines.find(line => /^https?:\/\//i.test(line.trim()));

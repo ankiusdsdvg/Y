@@ -3,6 +3,7 @@ const cors = require("cors");
 const db = require("./db");
 const { port, host } = require("./config");
 const { searchYouTube, getVideoInfo, getStreamInfo, pipeAudioToMp3 } = require("./youtube");
+const playback = require("./playback");
 
 const app = express();
 app.disable("x-powered-by");
@@ -31,27 +32,36 @@ app.get("/", (req, res) => res.json({
   endpoints: [
     "GET /health", "GET /api/youtube/search?q=...&limit=10",
     "GET /api/youtube/info?id=VIDEO_ID",
-    "GET /api/youtube/stream?id=VIDEO_ID&type=audio",
+    "GET /api/youtube/stream?id=VIDEO_ID&type=audio|video",
     "GET /api/youtube/audio/VIDEO_ID.mp3",
-    "GET /api/youtube/audio/VIDEO_ID.mp3",
+    "GET /api/youtube/watch?id=VIDEO_ID",
+    "GET /api/youtube/video.mjpg", "GET /api/youtube/audio.pcm",
+    "POST /api/youtube/stop",
     "GET /api/youtube/history?deviceId=esp32",
     "GET /api/youtube/favorites?deviceId=esp32",
     "POST /api/youtube/history", "POST /api/youtube/favorites",
     "DELETE /api/youtube/favorites/VIDEO_ID?deviceId=esp32"
   ]
 }));
-app.get("/health", (req, res) => res.json({ status: "ok", service: "youtube-audio-api", mode: "audio-only", cookies: false }));
+app.get("/health", (req, res) => res.json({ status: "ok", service: "youtube-api", playback: playback.status() }));
 
-// Audio-only playback: no video extraction, no MJPEG/PCM video pipeline, no cookies.
-app.get("/api/youtube/watch", (req, res) => {
+// Start one shared realtime decoder. Video (MJPEG) and audio (PCM) are
+// separate low-latency endpoints, matching an IPTV-style client pipeline.
+app.get("/api/youtube/watch", asyncRoute(async (req, res) => {
   const id = String(req.query.id || "");
   if (!validId(id)) return res.status(400).json({ success: false, error: "id không hợp lệ" });
+  await playback.start(id);
   res.json({
-    success: true, videoId: id, mode: "audio-only",
-    audio: `/api/youtube/audio/${encodeURIComponent(id)}.mp3`,
-    format: { audio: "MP3", bitrate: "128 kbps" }
+    success: true, videoId: id,
+    video: "/api/youtube/video.mjpg",
+    audio: "/api/youtube/audio.pcm",
+    format: { video: "MJPEG", width: Number(process.env.PLAYBACK_WIDTH || 320), height: Number(process.env.PLAYBACK_HEIGHT || 180), fps: Number(process.env.PLAYBACK_FPS || 10), audio: "PCM s16le", sampleRate: Number(process.env.PLAYBACK_AUDIO_RATE || 16000), channels: 1 }
   });
-});
+}));
+app.get("/api/youtube/video.mjpg", playback.videoStream);
+app.get("/api/youtube/audio.pcm", playback.audioStream);
+app.post("/api/youtube/stop", (req, res) => { playback.stop(); res.json({ success: true, message: "Playback stopped" }); });
+app.get("/api/youtube/playback/status", (req, res) => res.json({ success: true, playback: playback.status() }));
 
 app.get("/api/youtube/search", asyncRoute(async (req, res) => {
   const q = String(req.query.q || "").trim();
@@ -69,7 +79,7 @@ app.get("/api/youtube/info", asyncRoute(async (req, res) => {
 
 app.get("/api/youtube/stream", asyncRoute(async (req, res) => {
   const id = String(req.query.id || "");
-  const type = "audio";
+  const type = req.query.type === "video" ? "video" : "audio";
   if (!validId(id)) return res.status(400).json({ success: false, error: "id không hợp lệ" });
   res.json({ success: true, ...(await getStreamInfo(id, type)) });
 }));
