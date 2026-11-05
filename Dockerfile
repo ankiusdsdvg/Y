@@ -33,7 +33,7 @@ RUN npm install --omit=dev --no-audit --no-fund
 
 # IMPORTANT: build context must contain src/server.js at its root.
 COPY . .
-RUN test -f /app/src/server.js \
+RUN test -f /src/server.js \
     && mkdir -p /app/data
 
 EXPOSE 10000
