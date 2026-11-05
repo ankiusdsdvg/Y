@@ -2,7 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const db = require("./db");
 const { port, host } = require("./config");
-const { searchYouTube, getVideoInfo, getStreamInfo, pipeAudioToMp3 } = require("./youtube");
+const { searchYouTube, getVideoInfo, getStreamInfo, getMp4StreamInfo, pipeAudioToMp3 } = require("./youtube");
 const playback = require("./playback");
 
 const app = express();
@@ -34,6 +34,8 @@ app.get("/", (req, res) => res.json({
     "GET /api/youtube/info?id=VIDEO_ID",
     "GET /api/youtube/stream?id=VIDEO_ID&type=audio|video",
     "GET /api/youtube/audio/VIDEO_ID.mp3",
+    "GET /api/youtube/mp4?id=VIDEO_ID",
+    "GET /api/youtube/video/VIDEO_ID.mp4",
     "GET /api/youtube/watch?id=VIDEO_ID",
     "GET /api/youtube/video.mjpg", "GET /api/youtube/audio.pcm",
     "POST /api/youtube/stop",
@@ -82,6 +84,25 @@ app.get("/api/youtube/stream", asyncRoute(async (req, res) => {
   const type = req.query.type === "video" ? "video" : "audio";
   if (!validId(id)) return res.status(400).json({ success: false, error: "id không hợp lệ" });
   res.json({ success: true, ...(await getStreamInfo(id, type)) });
+}));
+
+// JSON endpoint: returns the expiring direct URL of the original MP4.
+app.get("/api/youtube/mp4", asyncRoute(async (req, res) => {
+  const id = String(req.query.id || "");
+  if (!validId(id)) return res.status(400).json({ success: false, error: "id không hợp lệ" });
+  const video = await getMp4StreamInfo(id);
+  res.setHeader("Cache-Control", "no-store");
+  res.json({ success: true, ...video });
+}));
+
+// Direct-play endpoint: redirects the player to YouTube's signed MP4 URL.
+// The media bytes are not proxied or transcoded by this Node.js server.
+app.get("/api/youtube/video/:id.mp4", asyncRoute(async (req, res) => {
+  const id = String(req.params.id || "");
+  if (!validId(id)) return res.status(400).json({ success: false, error: "id không hợp lệ" });
+  const video = await getMp4StreamInfo(id);
+  res.setHeader("Cache-Control", "no-store");
+  res.redirect(302, video.streamUrl);
 }));
 
 app.get("/api/youtube/audio/:id.mp3", (req, res) => {

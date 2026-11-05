@@ -149,6 +149,44 @@ async function getStreamInfo(id, kind = "audio") {
   if (!streamUrl) throw new Error("Không lấy được URL stream");
   return { videoId: String(id), type: kind, streamUrl: streamUrl.trim(), expiresNote: "URL có thể hết hạn; hãy gọi lại API để lấy URL mới." };
 }
+
+// Resolve one progressive MP4 format: a single native MP4 containing both
+// video and audio. No FFmpeg/transcoding is involved.
+async function getMp4StreamInfo(id) {
+  const url = videoUrl(String(id || "").trim());
+  const format = "best[ext=mp4][vcodec!=none][acodec!=none]";
+  const output = await runYtDlp([
+    ...baseArgs(), "--no-playlist", "--no-warnings",
+    "-f", format, "--dump-single-json", url
+  ]);
+  const info = JSON.parse(output);
+  const picked = info.requested_downloads?.[0] || info;
+  const streamUrl = picked.url || info.url;
+  if (!streamUrl || !/^https?:\/\//i.test(streamUrl)) {
+    throw new Error("Không tìm thấy luồng MP4 nguyên bản có cả hình và tiếng. Video này có thể chỉ cung cấp luồng DASH riêng.");
+  }
+  if (picked.ext && picked.ext !== "mp4") {
+    throw new Error("YouTube không cung cấp MP4 nguyên bản cho video này.");
+  }
+  if (picked.acodec === "none" || picked.vcodec === "none") {
+    throw new Error("Định dạng MP4 được chọn không có đủ hình và tiếng.");
+  }
+  return {
+    videoId: info.id || String(id),
+    type: "video",
+    format: "mp4",
+    formatId: picked.format_id || info.format_id || "",
+    resolution: picked.resolution || info.resolution || "",
+    width: picked.width || info.width || null,
+    height: picked.height || info.height || null,
+    filesize: picked.filesize || picked.filesize_approx || null,
+    videoCodec: picked.vcodec || info.vcodec || "",
+    audioCodec: picked.acodec || info.acodec || "",
+    streamUrl,
+    expiresNote: "URL MP4 có chữ ký và thời hạn; hãy gọi lại API để lấy URL mới."
+  };
+}
+
 function pipeAudioToMp3(id, req, res) {
   const url = videoUrl(String(id || "").trim());
   const ytdlpArgs = [...baseArgs(), "-f", "bestaudio", "-o", "-", url];
@@ -182,4 +220,4 @@ function pipeAudioToMp3(id, req, res) {
   });
   ffmpeg.once("close", () => { if (!closed) { res.end(); stop(); } });
 }
-module.exports = { searchYouTube, getVideoInfo, getStreamInfo, pipeAudioToMp3 };
+module.exports = { searchYouTube, getVideoInfo, getStreamInfo, getMp4StreamInfo, pipeAudioToMp3 };
